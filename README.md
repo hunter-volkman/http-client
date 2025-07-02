@@ -48,3 +48,14 @@ If your model implements DoCommand, provide an example payload of each command t
   }
 }
 ```
+
+#### Example DoCommand
+
+```json
+{
+  "command_name": {
+    "arg1": "foo",
+    "arg2": 1
+  }
+}
+```
