@@ -1,21 +1,21 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
-  "module_id": "hunter:http-client",
+  "module_id": "hunter:viam-yoobic",
   "visibility": "private",
-  "url": "",
+  "url": "https://github.com/hunter-volkman/viam-yoobic",
   "description": "Modular sensor component: yoobic",
   "models": [
     {
       "api": "rdk:component:sensor",
-      "model": "hunter:http-client:yoobic",
-      "short_description": "Provide a short (100 characters or less) description of this model here",
-      "markdown_link": "README.md#model-hunterhttp-clientyoobic"
+      "model": "hunter:viam-yoobic:yoobic",
+      "short_description": "Yoobic sensor integration for Viam",
+      "markdown_link": "README.md#model-hunterviam-yoobicyoobic"
     }
   ],
   "applications": null,
   "markdown_link": "README.md",
   "entrypoint": "./run.sh",
-  "first_run": "",
+  "first_run": "./setup.sh",
   "build": {
     "build": "./build.sh",
     "setup": "./setup.sh",
