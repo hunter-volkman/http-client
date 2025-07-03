@@ -1,15 +1,15 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
-  "module_id": "hunter:viam-yoobic",
+  "module_id": "hunter:yoobic",
   "visibility": "private",
   "url": "https://github.com/hunter-volkman/viam-yoobic",
-  "description": "Modular sensor component: yoobic",
+  "description": "YOOBIC integration module for operational workflows",
   "models": [
     {
       "api": "rdk:component:sensor",
-      "model": "hunter:viam-yoobic:yoobic",
-      "short_description": "Yoobic sensor integration for Viam",
-      "markdown_link": "README.md#model-hunterviam-yoobicyoobic"
+      "model": "hunter:yoobic:mission",
+      "short_description": "Mission management via YOOBIC API",
+      "markdown_link": "README.md#mission-model"
     }
   ],
   "applications": null,
