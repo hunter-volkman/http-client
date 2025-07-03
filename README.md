@@ -1,7 +1,6 @@
-# Module http-client 
+# Module http-client (yoobic)
 
 Provide a description of the purpose of the module and any relevant information.
-
 ## Model hunter:http-client:yoobic
 
 Provide a description of the model and any relevant information.
