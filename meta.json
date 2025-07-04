@@ -3,12 +3,12 @@
   "module_id": "hunter:yoobic",
   "visibility": "private",
   "url": "https://github.com/hunter-volkman/viam-yoobic",
-  "description": "YOOBIC integration module for operational workflows",
+  "description": "Connects sensor data with YOOBIC's retail operations platform to automate mission management.",
   "models": [
     {
       "api": "rdk:component:sensor",
       "model": "hunter:yoobic:mission",
-      "short_description": "Mission management via YOOBIC API",
+      "short_description": "Mission management via YOOBIC Public API integration",
       "markdown_link": "README.md#mission-model"
     }
   ],
