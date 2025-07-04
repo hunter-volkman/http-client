@@ -2,7 +2,7 @@ import asyncio
 import json
 import time
 from datetime import datetime, timedelta
-from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import requests
 from typing_extensions import Self
@@ -18,12 +18,13 @@ from viam.utils import SensorReading, ValueTypes, struct_to_dict
 LOGGER = getLogger(__name__)
 
 
-class Mission(Sensor, EasyResource):
+class MissionManager(Sensor, EasyResource):
     """
-    YOOBIC Mission Management for Pret Monitoring
+    Universal Mission Management Module
     
-    Handles mission lifecycle for temperature monitoring and inventory tracking.
-    Integrates Viam sensor data with YOOBIC operational workflows.
+    Integrates with operational workflow platforms to automate data collection,
+    mission creation, and compliance monitoring. Designed to be brand-agnostic
+    and configurable for various retail and operational use cases.
     """
 
     MODEL: ClassVar[Model] = Model(ModelFamily("hunter", "yoobic"), "mission")
@@ -31,23 +32,22 @@ class Mission(Sensor, EasyResource):
     def __init__(self, name: str):
         super().__init__(name)
         
-        # YOOBIC Configuration
-        self._yoobic_username = None
-        self._yoobic_password = None
-        self._environment = None
-        self._base_url = None
-        
-        # Authentication State
-        self._jwt_token = None
-        self._token_expires_at = None
+        # Platform Configuration
+        self._platform_config = {}
+        self._authentication = {}
         
         # Mission Configuration
-        self._store_locations = []
-        self._sync_interval = 300  # 5 minutes
-        self._temperature_threshold = 4.0  # Celsius
-        self._auto_create_missions = True
+        self._mission_rules = []
+        self._data_sources = []
+        self._notification_config = {}
         
-        # Status & Metrics
+        # Operational Settings
+        self._sync_interval = 300  # 5 minutes default
+        self._batch_size = 50
+        self._retry_attempts = 3
+        self._timeout = 30
+        
+        # State Management
         self._configured = False
         self._last_sync = None
         self._sync_errors = []
@@ -55,12 +55,16 @@ class Mission(Sensor, EasyResource):
             "missions_created": 0,
             "missions_completed": 0,
             "alerts_sent": 0,
-            "sync_count": 0
+            "sync_count": 0,
+            "error_count": 0,
+            "uptime_start": datetime.now()
         }
         
-        # Background Tasks
+        # Runtime
         self._sync_task = None
         self._session = None
+        self._auth_token = None
+        self._token_expires_at = None
 
     @classmethod
     def new(
@@ -77,68 +81,88 @@ class Mission(Sensor, EasyResource):
         """Validate configuration and return dependencies."""
         attrs = struct_to_dict(config.attributes) if config.attributes else {}
         
-        # Required fields
-        required = ["yoobic_username", "yoobic_password", "environment"]
-        for field in required:
-            if not attrs.get(field):
-                raise ValueError(f"{field} is required")
+        # Validate platform configuration
+        platform_config = attrs.get("platform", {})
+        if not platform_config:
+            raise ValueError("platform configuration is required")
         
-        # Validate environment
-        if attrs.get("environment") not in ["sandbox", "production"]:
-            raise ValueError("environment must be 'sandbox' or 'production'")
+        # Check required platform fields
+        required_platform_fields = ["type", "base_url", "authentication"]
+        for field in required_platform_fields:
+            if field not in platform_config:
+                raise ValueError(f"platform.{field} is required")
+        
+        # Validate authentication
+        auth_config = platform_config.get("authentication", {})
+        auth_method = auth_config.get("method", "")
+        if auth_method not in ["username_password", "api_key", "oauth"]:
+            raise ValueError("authentication.method must be 'username_password', 'api_key', or 'oauth'")
+        
+        # Validate mission rules
+        mission_rules = attrs.get("mission_rules", [])
+        if not isinstance(mission_rules, list):
+            raise ValueError("mission_rules must be a list")
+        
+        for i, rule in enumerate(mission_rules):
+            if not isinstance(rule, dict):
+                raise ValueError(f"mission_rules[{i}] must be an object")
             
-        # Validate store locations
-        store_locations = attrs.get("store_locations", [])
-        if not isinstance(store_locations, list):
-            raise ValueError("store_locations must be a list")
+            required_rule_fields = ["name", "trigger", "action"]
+            for field in required_rule_fields:
+                if field not in rule:
+                    raise ValueError(f"mission_rules[{i}].{field} is required")
         
-        return [], []  # No dependencies
+        return [], []  # No dependencies for now
 
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ):
-        """Reconfigure the mission sensor."""
+        """Reconfigure the mission manager."""
         attrs = struct_to_dict(config.attributes) if config.attributes else {}
         
-        # Stop existing background task
+        # Stop existing tasks
         self._stop_sync_task()
         
-        # Update configuration
-        self._yoobic_username = attrs["yoobic_username"]
-        self._yoobic_password = attrs["yoobic_password"] 
-        self._environment = attrs["environment"]
+        # Load platform configuration
+        self._platform_config = attrs.get("platform", {})
         
-        # Set base URL
-        if self._environment == "production":
-            self._base_url = "https://api.yoobic.com/public/api"
-        else:
-            self._base_url = "https://api-sandbox.yoobic.com/public/api"
+        # Load mission rules
+        self._mission_rules = attrs.get("mission_rules", [])
         
-        # Optional configuration
-        self._store_locations = attrs.get("store_locations", [])
+        # Load data sources
+        self._data_sources = attrs.get("data_sources", [])
+        
+        # Load notification config
+        self._notification_config = attrs.get("notifications", {})
+        
+        # Load operational settings
         self._sync_interval = attrs.get("sync_interval", 300)
-        self._temperature_threshold = attrs.get("temperature_threshold", 4.0)
-        self._auto_create_missions = attrs.get("auto_create_missions", True)
+        self._batch_size = attrs.get("batch_size", 50)
+        self._retry_attempts = attrs.get("retry_attempts", 3)
+        self._timeout = attrs.get("timeout", 30)
         
         # Initialize HTTP session
         self._session = requests.Session()
         self._session.headers.update({
-            "User-Agent": f"Viam-YOOBIC-Mission/{self.name}",
+            "User-Agent": f"Viam-Mission-Manager/{self.name}",
             "Content-Type": "application/json"
         })
         
         # Reset authentication
-        self._jwt_token = None
+        self._auth_token = None
         self._token_expires_at = None
         
         self._configured = True
         
-        LOGGER.info(f"Mission sensor configured: {self._environment}")
-        LOGGER.info(f"Store locations: {len(self._store_locations)}")
-        LOGGER.info(f"Sync interval: {self._sync_interval}s")
+        LOGGER.info(f"Mission Manager configured")
+        LOGGER.info(f"Platform: {self._platform_config.get('type', 'unknown')}")
+        LOGGER.info(f"Base URL: {self._platform_config.get('base_url', 'unknown')}")
+        LOGGER.info(f"Mission Rules: {len(self._mission_rules)}")
+        LOGGER.info(f"Data Sources: {len(self._data_sources)}")
+        LOGGER.info(f"Sync Interval: {self._sync_interval}s")
         
-        # Start background sync
-        if self._configured and self._auto_create_missions:
+        # Start background sync if auto-sync is enabled
+        if attrs.get("auto_sync", True):
             self._start_sync_task()
 
     async def get_readings(
@@ -148,14 +172,17 @@ class Mission(Sensor, EasyResource):
         timeout: Optional[float] = None,
         **kwargs
     ) -> Mapping[str, SensorReading]:
-        """Get mission sensor status and metrics."""
+        """Get mission manager status and metrics."""
         if not self._configured:
-            return {"error": "Module not configured", "configured": False}
+            return {"error": "Mission manager not configured", "configured": False}
         
         try:
             # Force sync if requested
             if extra and extra.get("force_sync"):
                 await self._perform_sync()
+            
+            # Calculate uptime
+            uptime = (datetime.now() - self._mission_stats["uptime_start"]).total_seconds()
             
             # Calculate next sync time
             next_sync_in = 0
@@ -166,20 +193,26 @@ class Mission(Sensor, EasyResource):
             readings = {
                 # Configuration
                 "configured": self._configured,
-                "environment": self._environment,
-                "store_count": len(self._store_locations),
-                "auto_create_enabled": self._auto_create_missions,
+                "platform_type": self._platform_config.get("type", "unknown"),
+                "base_url": self._platform_config.get("base_url", "unknown"),
+                "mission_rules_count": len(self._mission_rules),
+                "data_sources_count": len(self._data_sources),
                 
                 # Status
                 "last_sync": self._last_sync.isoformat() if self._last_sync else None,
                 "next_sync_in": round(next_sync_in, 1),
                 "auth_valid": self._is_token_valid(),
                 "sync_errors": len(self._sync_errors),
+                "uptime_seconds": round(uptime, 1),
                 
                 # Metrics
                 "mission_stats": self._mission_stats,
-                "temperature_threshold": self._temperature_threshold,
-                "background_task_running": self._sync_task is not None and not self._sync_task.done()
+                "background_task_running": self._sync_task is not None and not self._sync_task.done(),
+                
+                # Operational
+                "sync_interval": self._sync_interval,
+                "batch_size": self._batch_size,
+                "retry_attempts": self._retry_attempts
             }
             
             return readings
@@ -211,106 +244,292 @@ class Mission(Sensor, EasyResource):
         elif cmd == "test_connection":
             return await self._test_connection()
         elif cmd == "get_stats":
-            return {"stats": self._mission_stats, "errors": self._sync_errors[-5:]}
+            return await self._get_stats()
         elif cmd == "clear_errors":
-            self._sync_errors.clear()
-            return {"success": True, "message": "Errors cleared"}
+            return await self._clear_errors()
+        elif cmd == "evaluate_rules":
+            return await self._evaluate_rules_command(command)
         else:
             return {
                 "error": f"Unknown command: {cmd}",
                 "available_commands": [
                     "sync_now", "create_mission", "check_auth", "get_missions",
-                    "validate_mission", "test_connection", "get_stats", "clear_errors"
+                    "validate_mission", "test_connection", "get_stats", "clear_errors",
+                    "evaluate_rules"
                 ]
             }
 
     # Authentication Methods
     def _is_token_valid(self) -> bool:
-        """Check if JWT token is valid."""
-        return (self._jwt_token is not None and 
+        """Check if authentication token is valid."""
+        return (self._auth_token is not None and 
                 self._token_expires_at is not None and 
                 datetime.now() < self._token_expires_at)
 
     async def _authenticate(self) -> bool:
-        """Authenticate with YOOBIC API."""
+        """Authenticate with the platform API."""
         if self._is_token_valid():
             return True
-            
+        
         try:
-            auth_data = {
-                "username": self._yoobic_username,
-                "password": self._yoobic_password
-            }
+            auth_config = self._platform_config.get("authentication", {})
+            method = auth_config.get("method", "")
             
-            LOGGER.info(f"Authenticating with YOOBIC API ({self._environment})")
-            response = self._session.post(f"{self._base_url}/auth/login", json=auth_data, timeout=30)
-            
-            if response.status_code == 200:
-                data = response.json()
-                self._jwt_token = data.get("token")
-                
-                # Set token expiry (50 minutes for safety)
-                self._token_expires_at = datetime.now() + timedelta(minutes=50)
-                
-                # Update session headers
-                self._session.headers["Authorization"] = f"Bearer {self._jwt_token}"
-                
-                LOGGER.info("Successfully authenticated with YOOBIC")
-                return True
+            if method == "username_password":
+                return await self._authenticate_username_password(auth_config)
+            elif method == "api_key":
+                return await self._authenticate_api_key(auth_config)
+            elif method == "oauth":
+                return await self._authenticate_oauth(auth_config)
             else:
-                LOGGER.error(f"Authentication failed: {response.status_code} - {response.text}")
+                LOGGER.error(f"Unsupported authentication method: {method}")
                 return False
                 
         except Exception as e:
             LOGGER.error(f"Authentication error: {e}")
             return False
 
-    # Mission Operations
-    async def _create_temperature_mission(self, store_id: str, temperature: float) -> Dict:
-        """Create a temperature monitoring mission."""
+    async def _authenticate_username_password(self, auth_config: Dict) -> bool:
+        """Authenticate using username/password."""
+        username = auth_config.get("username")
+        password = auth_config.get("password")
+        
+        if not username or not password:
+            LOGGER.error("Username and password required for authentication")
+            return False
+        
+        auth_endpoint = auth_config.get("endpoint", "/auth/login")
+        url = f"{self._platform_config['base_url']}{auth_endpoint}"
+        
+        auth_data = {
+            "username": username,
+            "password": password
+        }
+        
+        LOGGER.info(f"Authenticating with platform at {url}")
+        response = self._session.post(url, json=auth_data, timeout=self._timeout)
+        
+        if response.status_code == 200:
+            data = response.json()
+            self._auth_token = data.get("token")
+            
+            # Set token expiry (default 50 minutes for safety)
+            expires_in = auth_config.get("token_expires_minutes", 50)
+            self._token_expires_at = datetime.now() + timedelta(minutes=expires_in)
+            
+            # Update session headers
+            self._session.headers["Authorization"] = f"Bearer {self._auth_token}"
+            
+            LOGGER.info("Successfully authenticated with platform")
+            return True
+        else:
+            LOGGER.error(f"Authentication failed: {response.status_code} - {response.text}")
+            return False
+
+    async def _authenticate_api_key(self, auth_config: Dict) -> bool:
+        """Authenticate using API key."""
+        api_key = auth_config.get("api_key")
+        if not api_key:
+            LOGGER.error("API key required for authentication")
+            return False
+        
+        # Set API key in headers
+        header_name = auth_config.get("header_name", "X-API-Key")
+        self._session.headers[header_name] = api_key
+        
+        # API keys typically don't expire, but set a long expiry
+        self._token_expires_at = datetime.now() + timedelta(days=365)
+        
+        LOGGER.info("API key authentication configured")
+        return True
+
+    async def _authenticate_oauth(self, auth_config: Dict) -> bool:
+        """Authenticate using OAuth (placeholder for future implementation)."""
+        LOGGER.error("OAuth authentication not yet implemented")
+        return False
+
+    # Mission Rule Engine
+    async def _evaluate_mission_rules(self, data: Dict) -> List[Dict]:
+        """Evaluate mission rules against provided data."""
+        missions_to_create = []
+        
+        for rule in self._mission_rules:
+            try:
+                if await self._evaluate_rule(rule, data):
+                    mission = await self._create_mission_from_rule(rule, data)
+                    if mission:
+                        missions_to_create.append(mission)
+            except Exception as e:
+                LOGGER.error(f"Error evaluating rule {rule.get('name', 'unknown')}: {e}")
+        
+        return missions_to_create
+
+    async def _evaluate_rule(self, rule: Dict, data: Dict) -> bool:
+        """Evaluate a single mission rule."""
+        trigger = rule.get("trigger", {})
+        trigger_type = trigger.get("type", "")
+        
+        if trigger_type == "threshold":
+            return self._evaluate_threshold_trigger(trigger, data)
+        elif trigger_type == "schedule":
+            return self._evaluate_schedule_trigger(trigger, data)
+        elif trigger_type == "event":
+            return self._evaluate_event_trigger(trigger, data)
+        else:
+            LOGGER.warning(f"Unknown trigger type: {trigger_type}")
+            return False
+
+    def _evaluate_threshold_trigger(self, trigger: Dict, data: Dict) -> bool:
+        """Evaluate threshold-based trigger."""
+        field = trigger.get("field", "")
+        operator = trigger.get("operator", "")
+        threshold = trigger.get("threshold", 0)
+        
+        if not field or field not in data:
+            return False
+        
+        value = data[field]
+        
+        if operator == "gt":
+            return value > threshold
+        elif operator == "lt":
+            return value < threshold
+        elif operator == "gte":
+            return value >= threshold
+        elif operator == "lte":
+            return value <= threshold
+        elif operator == "eq":
+            return value == threshold
+        elif operator == "ne":
+            return value != threshold
+        else:
+            LOGGER.warning(f"Unknown operator: {operator}")
+            return False
+
+    def _evaluate_schedule_trigger(self, trigger: Dict, data: Dict) -> bool:
+        """Evaluate schedule-based trigger."""
+        # Implementation for scheduled missions
+        return False  # Placeholder
+
+    def _evaluate_event_trigger(self, trigger: Dict, data: Dict) -> bool:
+        """Evaluate event-based trigger."""
+        # Implementation for event-based missions
+        return False  # Placeholder
+
+    async def _create_mission_from_rule(self, rule: Dict, data: Dict) -> Optional[Dict]:
+        """Create a mission based on rule and data."""
+        try:
+            action = rule.get("action", {})
+            
+            mission_data = {
+                "title": action.get("title", "").format(**data),
+                "type": action.get("type", "generic"),
+                "store_id": data.get("store_id", "unknown"),
+                "due_date": (datetime.now() + timedelta(hours=action.get("due_hours", 24))).isoformat(),
+                "priority": action.get("priority", "medium"),
+                "custom_fields": {
+                    "rule_name": rule.get("name"),
+                    "triggered_by": data,
+                    "created_by": "viam_mission_manager"
+                }
+            }
+            
+            # Add any additional fields from the rule
+            additional_fields = action.get("custom_fields", {})
+            mission_data["custom_fields"].update(additional_fields)
+            
+            return mission_data
+            
+        except Exception as e:
+            LOGGER.error(f"Error creating mission from rule: {e}")
+            return None
+
+    # Data Collection
+    async def _collect_data(self) -> List[Dict]:
+        """Collect data from configured sources."""
+        all_data = []
+        
+        for source in self._data_sources:
+            try:
+                data = await self._collect_from_source(source)
+                if data:
+                    all_data.extend(data)
+            except Exception as e:
+                LOGGER.error(f"Error collecting from source {source.get('name', 'unknown')}: {e}")
+        
+        return all_data
+
+    async def _collect_from_source(self, source: Dict) -> List[Dict]:
+        """Collect data from a single source."""
+        source_type = source.get("type", "")
+        
+        if source_type == "viam_sensor":
+            return await self._collect_viam_sensor_data(source)
+        elif source_type == "http_api":
+            return await self._collect_http_api_data(source)
+        elif source_type == "mock":
+            return await self._collect_mock_data(source)
+        else:
+            LOGGER.warning(f"Unknown data source type: {source_type}")
+            return []
+
+    async def _collect_viam_sensor_data(self, source: Dict) -> List[Dict]:
+        """Collect data from Viam sensors."""
+        # Implementation for collecting from Viam sensors
+        return []  # Placeholder
+
+    async def _collect_http_api_data(self, source: Dict) -> List[Dict]:
+        """Collect data from HTTP API."""
+        # Implementation for collecting from HTTP APIs
+        return []  # Placeholder
+
+    async def _collect_mock_data(self, source: Dict) -> List[Dict]:
+        """Generate mock data for testing."""
+        import random
+        
+        mock_data = []
+        stores = source.get("stores", ["store_001", "store_002"])
+        
+        for store_id in stores:
+            # Generate mock temperature data
+            base_temp = source.get("base_temperature", 2.5)
+            variation = random.uniform(-2.0, 5.0)
+            temperature = round(base_temp + variation, 1)
+            
+            mock_data.append({
+                "store_id": store_id,
+                "temperature": temperature,
+                "timestamp": datetime.now().isoformat(),
+                "sensor_id": f"temp_sensor_{store_id}",
+                "unit_name": f"Walk in Fridge"
+            })
+        
+        return mock_data
+
+    # Platform Integration
+    async def _create_platform_mission(self, mission_data: Dict) -> Dict:
+        """Create a mission on the platform."""
         try:
             if not await self._authenticate():
                 raise Exception("Authentication failed")
             
-            # Determine mission priority based on temperature
-            if temperature > self._temperature_threshold + 2:
-                priority = "high"
-                status = "critical"
-            elif temperature > self._temperature_threshold:
-                priority = "medium" 
-                status = "warning"
-            else:
-                priority = "low"
-                status = "normal"
+            endpoint = self._platform_config.get("endpoints", {}).get("create_mission", "/missions")
+            url = f"{self._platform_config['base_url']}{endpoint}"
             
-            mission_data = {
-                "title": f"Temperature Check - {store_id}",
-                "type": "mission",
-                "store_id": store_id,
-                "due_date": (datetime.now() + timedelta(hours=1)).isoformat(),
-                "custom_fields": {
-                    "temperature": temperature,
-                    "threshold": self._temperature_threshold,
-                    "status": status,
-                    "priority": priority,
-                    "sensor_type": "temperature",
-                    "created_by": "viam_mission_module"
-                }
-            }
-            
-            response = self._session.post(f"{self._base_url}/missions", json=mission_data, timeout=30)
+            response = self._session.post(url, json=mission_data, timeout=self._timeout)
             
             if response.status_code in [200, 201]:
                 mission = response.json()
                 self._mission_stats["missions_created"] += 1
                 
-                LOGGER.info(f"Created temperature mission for {store_id}: {temperature}°C")
-                return {"success": True, "mission_id": mission.get("mission_id"), "status": status}
+                LOGGER.info(f"Created mission: {mission_data['title']} for {mission_data['store_id']}")
+                return {"success": True, "mission": mission}
             else:
                 raise Exception(f"Mission creation failed: {response.status_code} - {response.text}")
                 
         except Exception as e:
-            LOGGER.error(f"Error creating temperature mission: {e}")
+            LOGGER.error(f"Error creating platform mission: {e}")
+            self._mission_stats["error_count"] += 1
             return {"success": False, "error": str(e)}
 
     # Background Sync
@@ -339,29 +558,32 @@ class Mission(Sensor, EasyResource):
                 break
             except Exception as e:
                 LOGGER.error(f"Error in sync loop: {e}")
+                self._mission_stats["error_count"] += 1
 
     async def _perform_sync(self):
-        """Perform data synchronization with YOOBIC."""
+        """Perform data synchronization and mission creation."""
         try:
             LOGGER.info("Starting sync operation")
             self._mission_stats["sync_count"] += 1
             
-            # Get mock temperature data (replace with real Viam data)
-            temperature_data = await self._get_temperature_data()
+            # Collect data from all sources
+            data_points = await self._collect_data()
             
-            # Create missions for temperature violations
+            # Evaluate mission rules against collected data
+            missions_to_create = []
+            for data_point in data_points:
+                missions = await self._evaluate_mission_rules(data_point)
+                missions_to_create.extend(missions)
+            
+            # Create missions on the platform
             missions_created = 0
-            for reading in temperature_data:
-                if reading["temperature"] > self._temperature_threshold:
-                    result = await self._create_temperature_mission(
-                        reading["store_id"], 
-                        reading["temperature"]
-                    )
-                    if result["success"]:
-                        missions_created += 1
+            for mission_data in missions_to_create:
+                result = await self._create_platform_mission(mission_data)
+                if result["success"]:
+                    missions_created += 1
             
             self._last_sync = datetime.now()
-            LOGGER.info(f"Sync completed: {missions_created} missions created")
+            LOGGER.info(f"Sync completed: {missions_created} missions created from {len(data_points)} data points")
             
         except Exception as e:
             error_info = {
@@ -372,27 +594,7 @@ class Mission(Sensor, EasyResource):
             self._sync_errors.append(error_info)
             self._sync_errors = self._sync_errors[-10:]  # Keep last 10 errors
             LOGGER.error(f"Sync failed: {e}")
-
-    async def _get_temperature_data(self) -> List[Dict]:
-        """Get temperature data (mock implementation)."""
-        # TODO: Replace with real Viam data client integration
-        import random
-        
-        mock_data = []
-        for store_id in self._store_locations or ["store_001", "store_002", "store_003"]:
-            # Generate realistic temperature with some above threshold
-            base_temp = 2.5
-            variation = random.uniform(-1.5, 4.0)  # Some will exceed threshold
-            temperature = round(base_temp + variation, 1)
-            
-            mock_data.append({
-                "store_id": store_id,
-                "temperature": temperature,
-                "timestamp": datetime.now().isoformat(),
-                "sensor_id": f"temp_sensor_{store_id}"
-            })
-        
-        return mock_data
+            self._mission_stats["error_count"] += 1
 
     # DoCommand Implementations
     async def _manual_sync(self) -> Dict[str, Any]:
@@ -414,26 +616,29 @@ class Mission(Sensor, EasyResource):
             return {
                 "authenticated": auth_success,
                 "token_valid": self._is_token_valid(),
-                "environment": self._environment,
-                "base_url": self._base_url
+                "platform_type": self._platform_config.get("type", "unknown"),
+                "base_url": self._platform_config.get("base_url", "unknown")
             }
         except Exception as e:
             return {"authenticated": False, "error": str(e)}
 
     async def _test_connection(self) -> Dict[str, Any]:
-        """Test YOOBIC API connection."""
+        """Test platform API connection."""
         try:
             if not await self._authenticate():
                 return {"success": False, "error": "Authentication failed"}
             
             # Test API call
-            response = self._session.get(f"{self._base_url}/tenants", timeout=10)
+            endpoint = self._platform_config.get("endpoints", {}).get("health", "/health")
+            url = f"{self._platform_config['base_url']}{endpoint}"
+            
+            response = self._session.get(url, timeout=10)
             
             return {
                 "success": response.status_code == 200,
                 "status_code": response.status_code,
                 "response_time": response.elapsed.total_seconds(),
-                "environment": self._environment
+                "platform_type": self._platform_config.get("type", "unknown")
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -441,13 +646,16 @@ class Mission(Sensor, EasyResource):
     async def _create_mission_command(self, command: Dict) -> Dict[str, Any]:
         """Create mission via command."""
         try:
-            store_id = command.get("store_id")
-            temperature = command.get("temperature")
+            mission_data = {
+                "title": command.get("title", "Manual Mission"),
+                "type": command.get("type", "manual"),
+                "store_id": command.get("store_id", "unknown"),
+                "due_date": command.get("due_date", (datetime.now() + timedelta(hours=24)).isoformat()),
+                "priority": command.get("priority", "medium"),
+                "custom_fields": command.get("custom_fields", {})
+            }
             
-            if not store_id or temperature is None:
-                return {"success": False, "error": "store_id and temperature required"}
-            
-            result = await self._create_temperature_mission(store_id, float(temperature))
+            result = await self._create_platform_mission(mission_data)
             return result
             
         except Exception as e:
@@ -459,26 +667,23 @@ class Mission(Sensor, EasyResource):
             if not await self._authenticate():
                 return {"success": False, "error": "Authentication failed"}
             
-            store_id = command.get("store_id")
-            limit = command.get("limit", 10)
+            endpoint = self._platform_config.get("endpoints", {}).get("get_missions", "/missions")
+            url = f"{self._platform_config['base_url']}{endpoint}"
             
-            # Build filter
-            filter_params = {"limit": limit}
-            if store_id:
-                filter_params["where"] = {"store_id": store_id}
+            params = {}
+            if command.get("store_id"):
+                params["store_id"] = command["store_id"]
+            if command.get("limit"):
+                params["limit"] = command["limit"]
             
-            response = self._session.get(
-                f"{self._base_url}/missions",
-                params={"filter": json.dumps(filter_params)},
-                timeout=30
-            )
+            response = self._session.get(url, params=params, timeout=self._timeout)
             
             if response.status_code == 200:
                 data = response.json()
                 return {
                     "success": True,
                     "missions": data.get("data", []),
-                    "count": len(data.get("data", []))
+                    "count": data.get("count", 0)
                 }
             else:
                 return {"success": False, "error": f"API error: {response.status_code}"}
@@ -493,35 +698,66 @@ class Mission(Sensor, EasyResource):
                 return {"success": False, "error": "Authentication failed"}
             
             mission_id = command.get("mission_id")
-            compliant = command.get("compliant", True)
-            
             if not mission_id:
                 return {"success": False, "error": "mission_id required"}
             
+            endpoint = self._platform_config.get("endpoints", {}).get("validate_mission", f"/missions/{mission_id}/validate")
+            url = f"{self._platform_config['base_url']}{endpoint}"
+            
             validation_data = {
-                "compliant": compliant,
-                "rating": 5 if compliant else 2,
-                "reason_noncompliant": None if compliant else "Temperature threshold exceeded"
+                "compliant": command.get("compliant", True),
+                "rating": command.get("rating", 5),
+                "reason_noncompliant": command.get("reason_noncompliant"),
+                "validation_data": command.get("validation_data", {})
             }
             
-            response = self._session.post(
-                f"{self._base_url}/missions/{mission_id}/validate",
-                json=validation_data,
-                timeout=30
-            )
+            response = self._session.post(url, json=validation_data, timeout=self._timeout)
             
             if response.status_code in [200, 201]:
                 self._mission_stats["missions_completed"] += 1
-                return {"success": True, "validated": compliant}
+                return {"success": True, "validated": validation_data["compliant"]}
             else:
                 return {"success": False, "error": f"Validation failed: {response.status_code}"}
                 
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    async def _get_stats(self) -> Dict[str, Any]:
+        """Get mission statistics."""
+        uptime = (datetime.now() - self._mission_stats["uptime_start"]).total_seconds()
+        
+        return {
+            "success": True,
+            "stats": {
+                **self._mission_stats,
+                "uptime_seconds": round(uptime, 1),
+                "error_rate": self._mission_stats["error_count"] / max(1, self._mission_stats["sync_count"]),
+                "recent_errors": self._sync_errors[-5:]
+            }
+        }
+
+    async def _clear_errors(self) -> Dict[str, Any]:
+        """Clear error log."""
+        self._sync_errors.clear()
+        return {"success": True, "message": "Errors cleared"}
+
+    async def _evaluate_rules_command(self, command: Dict) -> Dict[str, Any]:
+        """Evaluate rules against provided data."""
+        try:
+            data = command.get("data", {})
+            missions = await self._evaluate_mission_rules(data)
+            
+            return {
+                "success": True,
+                "missions_to_create": missions,
+                "count": len(missions)
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     async def close(self):
         """Clean up resources."""
-        LOGGER.info(f"Shutting down mission sensor: {self.name}")
+        LOGGER.info(f"Shutting down mission manager: {self.name}")
         self._stop_sync_task()
         
         if self._session:
